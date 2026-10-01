@@ -69,6 +69,16 @@ bin/twilio-call result --sid CAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx --wait 15
 
 Worked examples: [confirm a reservation](examples/confirm-reservation.md), [cancel an appointment](examples/cancel-appointment.md).
 
+## Testing
+
+The test suite runs fully offline against a fake Twilio API, so it needs no credentials and places no calls:
+
+```bash
+python3 -m unittest discover tests
+```
+
+It covers setup provisioning and re-runs, call placement and TwiML, status, result polling, Twilio error reporting, and (when Node.js is installed) the deployed keypad Function. Before relying on the skill, also run `setup` and place one test call to a number you have verified in Twilio.
+
 ## Limitations
 
 Supported: outbound calls, text-to-speech messages, single-digit keypad menus, call status, and keypad result retrieval.

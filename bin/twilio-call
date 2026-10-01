@@ -24,6 +24,7 @@ ENV_NAME = "production"
 FUNCTION_NAME = "gather-handler"
 FUNCTION_PATH = "/gather-handler"
 MAP_NAME = "keypad-results"
+TWILIO_NODE_VERSION = "^5.0.0"
 RESULT_TTL = 86400  # seconds; results expire after 24 hours
 
 E164 = re.compile(r"^\+[1-9]\d{6,14}$")
@@ -184,7 +185,8 @@ def cmd_setup(args):
 
     print("Provisioning Sync service and map...")
     sync = "https://sync.twilio.com/v1"
-    sync_svc = request("GET", f"{sync}/Services/{SERVICE_NAME}", ok404=True) or request(
+    sync_services = request("GET", f"{sync}/Services")["services"]
+    sync_svc = find(sync_services, "unique_name", SERVICE_NAME) or request(
         "POST", f"{sync}/Services", form={"UniqueName": SERVICE_NAME, "FriendlyName": SERVICE_NAME}
     )
     sync_sid = sync_svc["sid"]
@@ -207,7 +209,7 @@ def cmd_setup(args):
         f"https://serverless-upload.twilio.com/v1/Services/{svc_sid}/Functions/{func['sid']}/Versions",
         multipart={
             "Path": FUNCTION_PATH,
-            "Visibility": "public",
+            "Visibility": "protected",
             "Content": ("gather-handler.js", "application/javascript", FUNCTION_CODE),
         },
     )
@@ -223,7 +225,10 @@ def cmd_setup(args):
     print("Building (this can take a minute)...")
     build = request(
         "POST", serverless(f"/Services/{svc_sid}/Builds"),
-        form={"FunctionVersions": [version["sid"]]},
+        form={
+            "FunctionVersions": [version["sid"]],
+            "Dependencies": json.dumps([{"name": "twilio", "version": TWILIO_NODE_VERSION}]),
+        },
     )
     deadline = time.time() + 300
     while build["status"] not in ("completed", "failed"):
@@ -286,6 +291,8 @@ def cmd_place(args):
     from_number = args.from_number or cfg.get("from_number")
     if not from_number:
         raise TwilioError("No caller number. Run `bin/twilio-call setup` or pass --from.")
+    if not E164.match(from_number):
+        raise TwilioError("--from must be E.164, e.g. +15551234567.")
     call = request(
         "POST", f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Calls.json",
         form={"To": args.to, "From": from_number, "Twiml": twiml},
