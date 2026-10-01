@@ -1,0 +1,24 @@
+# Secrets and local config
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+config.json
+.muse-phone-calls/
+.config/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.log

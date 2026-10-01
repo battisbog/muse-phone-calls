@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""twilio-call: place outbound Twilio voice calls and collect keypad results.
+
+Commands: setup, place, status, result.
+Standard library only. Credentials come from TWILIO_ACCOUNT_SID and
+TWILIO_AUTH_TOKEN in the environment and are never written to disk.
+"""
+import argparse
+import base64
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from xml.sax.saxutils import escape
+
+CONFIG_PATH = os.path.expanduser("~/.config/muse-phone-calls/config.json")
+SERVICE_NAME = "muse-phone-calls"
+ENV_NAME = "production"
+FUNCTION_NAME = "gather-handler"
+FUNCTION_PATH = "/gather-handler"
+MAP_NAME = "keypad-results"
+RESULT_TTL = 86400  # seconds; results expire after 24 hours
+
+E164 = re.compile(r"^\+[1-9]\d{6,14}$")
+CALL_SID = re.compile(r"^CA[0-9a-fA-F]{32}$")
+
+FUNCTION_CODE = """\
+exports.handler = async function (context, event, callback) {
+  const client = context.getTwilioClient();
+  const twiml = new Twilio.twiml.VoiceResponse();
+  const digits = event.Digits;
+  if (event.CallSid && digits) {
+    const items = client.sync.v1
+      .services(context.SYNC_SERVICE_SID)
+      .syncMaps(context.SYNC_MAP_NAME)
+      .syncMapItems;
+    const payload = { data: { digits: String(digits) }, ttl: %d };
+    try {
+      await items.create({ key: event.CallSid, ...payload });
+    } catch (e) {
+      if (e.status === 409) {
+        await items(event.CallSid).update(payload);
+      } else {
+        return callback(e);
+      }
+    }
+  }
+  twiml.say('Thank you. Goodbye.');
+  twiml.hangup();
+  return callback(null, twiml);
+};
+""" % RESULT_TTL
+
+
+class TwilioError(Exception):
+    pass
+
+
+def creds():
+    sid = os.environ.get("TWILIO_ACCOUNT_SID")
+    token = os.environ.get("TWILIO_AUTH_TOKEN")
+    if not sid or not token:
+        raise TwilioError(
+            "TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN must be set in the environment."
+        )
+    return sid, token
+
+
+def request(method, url, form=None, multipart=None, ok404=False):
+    sid, token = creds()
+    headers = {
+        "Authorization": "Basic " + base64.b64encode(f"{sid}:{token}".encode()).decode(),
+        "Accept": "application/json",
+    }
+    data = None
+    if multipart is not None:
+        boundary = uuid.uuid4().hex
+        body = b""
+        for name, value in multipart.items():
+            body += f"--{boundary}\r\n".encode()
+            if isinstance(value, tuple):
+                filename, ctype, content = value
+                body += (
+                    f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'
+                    f"Content-Type: {ctype}\r\n\r\n"
+                ).encode() + content.encode() + b"\r\n"
+            else:
+                body += (
+                    f'Content-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'
+                ).encode()
+        body += f"--{boundary}--\r\n".encode()
+        data = body
+        headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+    elif form is not None:
+        data = urllib.parse.urlencode(form, doseq=True).encode()
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            raw = resp.read()
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        if e.code == 404 and ok404:
+            return None
+        raw = e.read().decode(errors="replace")
+        try:
+            err = json.loads(raw)
+            raise TwilioError(
+                f"Twilio error {err.get('code', e.code)}: {err.get('message', raw)}"
+            )
+        except ValueError:
+            raise TwilioError(f"Twilio HTTP {e.code}: {raw[:300]}")
+    except urllib.error.URLError as e:
+        raise TwilioError(f"Network error: {e.reason}")
+
+
+def load_config():
+    try:
+        with open(CONFIG_PATH) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(cfg):
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    fd = os.open(CONFIG_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+
+
+def parse_menu(menu):
+    items = []
+    for part in menu.split(","):
+        digit, sep, label = part.partition(":")
+        digit, label = digit.strip(), label.strip()
+        if not sep or not re.fullmatch(r"[0-9]", digit) or not label:
+            raise TwilioError(f'Invalid --menu entry {part!r}; expected "1:Label,2:Label".')
+        items.append((digit, label))
+    if not items:
+        raise TwilioError("--menu is empty.")
+    return items
+
+
+def build_twiml(message, menu, action_url):
+    if not menu:
+        return f"<Response><Say>{escape(message)}</Say></Response>"
+    spoken = " ".join(f"Press {d} to {l}." for d, l in menu)
+    return (
+        "<Response>"
+        f'<Gather numDigits="1" timeout="10" method="POST" action="{escape(action_url, {chr(34): "&quot;"})}">'
+        f"<Say>{escape(message)} {escape(spoken)}</Say>"
+        "</Gather>"
+        "<Say>We did not receive a response. Goodbye.</Say>"
+        "</Response>"
+    )
+
+
+# ---------------------------------------------------------------- setup
+
+def serverless(path):
+    return f"https://serverless.twilio.com/v1{path}"
+
+
+def find(items, key, value):
+    return next((i for i in items if i.get(key) == value), None)
+
+
+def cmd_setup(args):
+    sid, _ = creds()
+    print("Provisioning Serverless service...")
+    services = request("GET", serverless("/Services"))["services"]
+    svc = find(services, "unique_name", SERVICE_NAME) or request(
+        "POST", serverless("/Services"),
+        form={"UniqueName": SERVICE_NAME, "FriendlyName": SERVICE_NAME, "IncludeCredentials": "true"},
+    )
+    svc_sid = svc["sid"]
+
+    print("Provisioning Sync service and map...")
+    sync = "https://sync.twilio.com/v1"
+    sync_svc = request("GET", f"{sync}/Services/{SERVICE_NAME}", ok404=True) or request(
+        "POST", f"{sync}/Services", form={"UniqueName": SERVICE_NAME, "FriendlyName": SERVICE_NAME}
+    )
+    sync_sid = sync_svc["sid"]
+    request("GET", f"{sync}/Services/{sync_sid}/Maps/{MAP_NAME}", ok404=True) or request(
+        "POST", f"{sync}/Services/{sync_sid}/Maps", form={"UniqueName": MAP_NAME}
+    )
+
+    print("Provisioning environment and function...")
+    envs = request("GET", serverless(f"/Services/{svc_sid}/Environments"))["environments"]
+    env = find(envs, "unique_name", ENV_NAME) or request(
+        "POST", serverless(f"/Services/{svc_sid}/Environments"),
+        form={"UniqueName": ENV_NAME, "DomainSuffix": "prod"},
+    )
+    funcs = request("GET", serverless(f"/Services/{svc_sid}/Functions"))["functions"]
+    func = find(funcs, "friendly_name", FUNCTION_NAME) or request(
+        "POST", serverless(f"/Services/{svc_sid}/Functions"), form={"FriendlyName": FUNCTION_NAME}
+    )
+    version = request(
+        "POST",
+        f"https://serverless-upload.twilio.com/v1/Services/{svc_sid}/Functions/{func['sid']}/Versions",
+        multipart={
+            "Path": FUNCTION_PATH,
+            "Visibility": "public",
+            "Content": ("gather-handler.js", "application/javascript", FUNCTION_CODE),
+        },
+    )
+
+    for key, value in (("SYNC_SERVICE_SID", sync_sid), ("SYNC_MAP_NAME", MAP_NAME)):
+        base = serverless(f"/Services/{svc_sid}/Environments/{env['sid']}/Variables")
+        existing = find(request("GET", base)["variables"], "key", key)
+        if existing:
+            request("POST", f"{base}/{existing['sid']}", form={"Value": value})
+        else:
+            request("POST", base, form={"Key": key, "Value": value})
+
+    print("Building (this can take a minute)...")
+    build = request(
+        "POST", serverless(f"/Services/{svc_sid}/Builds"),
+        form={"FunctionVersions": [version["sid"]]},
+    )
+    deadline = time.time() + 300
+    while build["status"] not in ("completed", "failed"):
+        if time.time() > deadline:
+            raise TwilioError("Timed out waiting for the Function build.")
+        time.sleep(3)
+        build = request("GET", serverless(f"/Services/{svc_sid}/Builds/{build['sid']}"))
+    if build["status"] == "failed":
+        raise TwilioError("Function build failed; check the Twilio console build logs.")
+
+    print("Deploying...")
+    request(
+        "POST", serverless(f"/Services/{svc_sid}/Environments/{env['sid']}/Deployments"),
+        form={"BuildSid": build["sid"]},
+    )
+    env = request("GET", serverless(f"/Services/{svc_sid}/Environments/{env['sid']}"))
+
+    from_number = args.from_number
+    if not from_number:
+        nums = request(
+            "GET", f"https://api.twilio.com/2010-04-01/Accounts/{sid}/IncomingPhoneNumbers.json"
+        )["incoming_phone_numbers"]
+        voice = [n for n in nums if n.get("capabilities", {}).get("voice")]
+        if not voice:
+            raise TwilioError("No voice-capable Twilio number found. Buy one or pass --from.")
+        from_number = voice[0]["phone_number"]
+    elif not E164.match(from_number):
+        raise TwilioError("--from must be E.164, e.g. +15551234567.")
+
+    save_config({
+        "from_number": from_number,
+        "service_sid": svc_sid,
+        "sync_service_sid": sync_sid,
+        "map_name": MAP_NAME,
+        "domain": env["domain_name"],
+    })
+    print(f"Setup complete. Caller number: {from_number}")
+    print(f"Config written to {CONFIG_PATH}")
+
+
+# ---------------------------------------------------------------- place / status / result
+
+def cmd_place(args):
+    if not E164.match(args.to):
+        raise TwilioError("--to must be E.164, e.g. +15551234567.")
+    cfg = load_config()
+    menu = parse_menu(args.menu) if args.menu else None
+    action = ""
+    if menu:
+        if not cfg.get("domain"):
+            if not args.dry_run:
+                raise TwilioError("No config found. Run `bin/twilio-call setup` first.")
+            cfg["domain"] = "<your-function-domain>"
+        action = f"https://{cfg['domain']}{FUNCTION_PATH}"
+    twiml = build_twiml(args.message, menu, action)
+    if args.dry_run:
+        print(twiml)
+        return
+    sid, _ = creds()
+    from_number = args.from_number or cfg.get("from_number")
+    if not from_number:
+        raise TwilioError("No caller number. Run `bin/twilio-call setup` or pass --from.")
+    call = request(
+        "POST", f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Calls.json",
+        form={"To": args.to, "From": from_number, "Twiml": twiml},
+    )
+    print(json.dumps({"sid": call["sid"], "status": call["status"], "to": call["to"],
+                      "from": call["from"]}, indent=2))
+
+
+def check_sid(sid):
+    if not CALL_SID.match(sid):
+        raise TwilioError("--sid must be a Call SID (CA + 32 hex characters).")
+
+
+def cmd_status(args):
+    check_sid(args.sid)
+    sid, _ = creds()
+    call = request("GET", f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Calls/{args.sid}.json")
+    keys = ("sid", "status", "duration", "start_time", "end_time", "date_created", "date_updated")
+    print(json.dumps({k: call.get(k) for k in keys}, indent=2))
+
+
+def cmd_result(args):
+    check_sid(args.sid)
+    cfg = load_config()
+    if not cfg.get("sync_service_sid"):
+        raise TwilioError("No config found. Run `bin/twilio-call setup` first.")
+    url = (f"https://sync.twilio.com/v1/Services/{cfg['sync_service_sid']}"
+           f"/Maps/{cfg.get('map_name', MAP_NAME)}/Items/{args.sid}")
+    deadline = time.time() + max(args.wait, 0)
+    while True:
+        item = request("GET", url, ok404=True)
+        if item is not None:
+            print(json.dumps({"sid": args.sid, "digits": item["data"].get("digits")}, indent=2))
+            return
+        if time.time() >= deadline:
+            print(json.dumps({"sid": args.sid, "digits": None}, indent=2))
+            return
+        time.sleep(2)
+
+
+def main():
+    p = argparse.ArgumentParser(prog="twilio-call", description=__doc__)
+    sub = p.add_subparsers(dest="command", required=True)
+
+    s = sub.add_parser("setup", help="one-time Twilio provisioning")
+    s.add_argument("--from", dest="from_number", help="caller number (E.164)")
+    s.set_defaults(func=cmd_setup)
+
+    s = sub.add_parser("place", help="place an outbound call")
+    s.add_argument("--to", required=True, help="destination number (E.164)")
+    s.add_argument("--message", required=True, help="text to speak")
+    s.add_argument("--from", dest="from_number", help="caller number (E.164)")
+    s.add_argument("--menu", help='keypad menu, e.g. "1:Confirm,2:Cancel"')
+    s.add_argument("--dry-run", action="store_true", help="print TwiML, do not call")
+    s.set_defaults(func=cmd_place)
+
+    s = sub.add_parser("status", help="check call status")
+    s.add_argument("--sid", required=True)
+    s.set_defaults(func=cmd_status)
+
+    s = sub.add_parser("result", help="get the captured keypad digit")
+    s.add_argument("--sid", required=True)
+    s.add_argument("--wait", type=int, default=0, help="seconds to poll for a result")
+    s.set_defaults(func=cmd_result)
+
+    args = p.parse_args()
+    try:
+        args.func(args)
+    except TwilioError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
